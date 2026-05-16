@@ -1,9 +1,61 @@
 # 01 Micrograd
 
-Goal: build a tiny scalar-valued autograd engine and use it to train a small neural network.
+这个 notebook 是跟着 Andrej Karpathy 的 micrograd 课程写下来的。表面上是在
+实现一个很小的自动求导引擎，实际更像是在把“神经网络为什么能训练”这件事拆成
+一个个可以看见的步骤。
 
-Suggested files:
+一开始最容易混淆的是 `data` 和 `grad`。`data` 是当前节点的值，`grad` 不是
+“这个节点自己的变化”，而是最终输出对这个节点的导数。理解这一点之后，像
+`x2.grad = w2.data * x2w2.grad` 这样的公式才开始变得合理：当前节点对最终结果
+的影响，不是直接凭空出现的，而是“局部影响”乘上“下游对最终结果的影响”。
 
-- `engine.py` for the `Value` object and backpropagation logic.
-- `nn.py` for simple neural-network modules.
-- `demo.ipynb` or `train.py` for experiments.
+实现 `Value` 的时候，真正卡住的是 `_backward` 为什么要在创建新 `Value` 时就
+定义好。后来发现这里依赖的是闭包：`a + b` 生成 `out` 的那一刻，`_backward`
+已经记住了参与这次运算的 `a`、`b` 和 `out`。等到之后调用 `out._backward()`，
+它就能把 `out.grad` 分发回 `a.grad` 和 `b.grad`。这也解释了为什么 `self` 指的
+不是调用 `_backward` 的对象，而是当初创建这个闭包时参与运算的那个对象。
+
+另一个重要问题是梯度为什么要用 `+=`。如果一个 `Value` 通过多条路径影响最终
+输出，那么每条路径都会贡献一部分梯度。直接赋值会覆盖前一条路径的贡献，累加
+才符合链式法则在 DAG 上的传播方式。Jupyter 里反复运行 cell 时，旧对象的梯度
+还会残留，这也让“清空梯度”变成了一个具体的问题，而不是框架里的抽象规则。
+
+Graphviz 的可视化被改成了值节点和操作节点分开显示。这样看 DAG 会直观很多：
+`+`、`*`、`tanh`、`exp` 不再只是写在值节点里的标签，而是真的成为图上的运算
+节点。手动展开 `tanh` 的版本也保留了下来：
+
+```python
+e = (2 * n).exp()
+o = (e - 1) / (e + 1)
+```
+
+这让 `tanh` 不再像一个黑盒，而是可以继续拆成更基础的 `Value` 运算。
+
+到 MLP 的部分，新的困惑变成了：随机初始化的神经网络，为什么会因为几个 `ys`
+就慢慢接近目标？关键理解是，`ys` 并不会直接进入模型。模型只接收 `xs`，然后
+输出 `ypred`；`ys` 只在 loss 里出现：
+
+```python
+loss = sum((yout - ygt) ** 2 for ygt, yout in zip(ys, ypred))
+```
+
+也就是说，标签不是在告诉模型“内部应该怎么算”，而是在 loss 这里定义“什么叫
+错”。反向传播做的事情，是把这个错误沿着计算图传回每个参数，得到
+`d(loss) / d(parameter)`。梯度下降再用这些梯度去修改参数：
+
+```python
+for p in model.parameters():
+    p.data += -0.01 * p.grad
+```
+
+这一步确实是在修改模型本身，因为 `parameters()` 返回的是模型内部权重和 bias
+的引用。改完参数以后，旧的 `loss` 不会自动变化；必须重新 forward，重新得到
+新的 `ypred` 和新的 `loss`。这也是训练循环的核心：
+
+```text
+forward -> loss -> backward -> update
+```
+
+这一节目前最有价值的结论是：反向传播本身不训练模型，它只负责算梯度；真正让
+模型变化的是梯度下降那一步。loss 负责定义目标，backward 负责分配责任，参数
+更新负责让模型往局部更好的方向移动。
